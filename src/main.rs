@@ -3,6 +3,7 @@
 extern crate rocket;
 use argon2::{self, Config};
 use postgres::{Client, NoTls};
+use reqwest;
 use rocket::http::Method;
 use rocket_contrib::json::Json;
 use rocket_cors;
@@ -10,13 +11,57 @@ use rocket_cors::{AllowedHeaders, AllowedOrigins, Cors, CorsOptions};
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json;
-use std::sync::{Arc, Mutex};
 use std::{thread, time};
 use uuid::Uuid;
 
 //fn save(db: &Database) {
 //fs::write("db.json", serde_json::to_string(&db).unwrap()).unwrap();
 //}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct TokenInfo {
+    token: String,
+    username: Option<String>,
+    error: bool,
+    error_message: Option<String>,
+}
+#[derive(Serialize, Deserialize)]
+struct TokenResponse {
+    error: bool,
+    error_message: Option<String>,
+    username: Option<String>,
+}
+fn check_token(token: &str) -> TokenInfo {
+    let client = reqwest::blocking::Client::new();
+    let res = client
+        .post("http://auth/check_token")
+        .body(serde_json::to_string(&serde_json::json!({ "token": token.clone() })).unwrap())
+        .header("content-type", "application/json")
+        .send();
+    match res {
+        Ok(res) => match res.json::<TokenResponse>() {
+            Ok(res) => TokenInfo {
+                token: token.to_owned(),
+                username: res.username,
+                error: false,
+                error_message: None,
+            },
+            Err(_) => TokenInfo {
+                token: token.to_owned(),
+                username: None,
+                error: true,
+                error_message: Some("Error parsing JSON".to_owned()),
+            },
+        },
+        Err(_) => TokenInfo {
+            token: token.to_owned(),
+            username: None,
+            error: true,
+            error_message: Some("Error sending request".to_owned()),
+        },
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct ResetRequest {
     username: String,
@@ -108,39 +153,31 @@ fn login(data: Json<LoginRequest>) -> Json<serde_json::Value> {
 #[post("/me", format = "application/json", data = "<data>")]
 fn me(data: Json<MeRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if let Ok(_) = client.query_one("SELECT * FROM users WHERE username = $1", &[&data.username]) {
-        if let Ok(_) = client.query_one(
-            "SELECT username FROM tokens WHERE token = $1",
-            &[&data.token],
-        ) {
-            let mut todos: Vec<Todo> = client
-                .query(
-                    "SELECT * FROM todos WHERE username = $1 ORDER BY num",
-                    &[&data.username.to_string()],
-                )
-                .unwrap()
-                .iter()
-                .map(|n| Todo {
-                    text: n.get("todo"),
-                    done: n.get("done"),
-                    id: n.get("id"),
-                    num: n.get("num"),
-                })
-                .collect();
-            Json(serde_json::json!({
-                "error": false,
-                "response": {
-                    "user": {"username": data.username, "todos": todos},
-                }
-            }))
-        } else {
-            Json(serde_json::json!({
-                "error": true, "error_message": "Incorrect token"
-            }))
-        }
+    let token_check = check_token(&data.token);
+    if !token_check.error {
+        let todos: Vec<Todo> = client
+            .query(
+                "SELECT * FROM todos WHERE username = $1 ORDER BY num",
+                &[&token_check.username.unwrap()],
+            )
+            .unwrap()
+            .iter()
+            .map(|n| Todo {
+                text: n.get("todo"),
+                done: n.get("done"),
+                id: n.get("id"),
+                num: n.get("num"),
+            })
+            .collect();
+        Json(serde_json::json!({
+            "error": false,
+            "response": {
+                "user": {"username": data.username, "todos": todos},
+            }
+        }))
     } else {
         Json(serde_json::json!({
-            "error": true, "error_message": "User doesn't exist"
+            "error": true, "error_message": token_check.error_message.unwrap()
         }))
     }
 }
@@ -197,85 +234,74 @@ fn email(data: Json<EmailRequest>) -> Json<serde_json::Value> {
 #[post("/update", format = "application/json", data = "<data>")]
 fn update(data: Json<UpdateRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if let Ok(user) = client.query_one(
-        "SELECT * FROM users WHERE username = $1",
-        &[&data.username.to_string()],
-    ) {
-        if let Ok(_) = client.query_one(
-            "SELECT username FROM tokens WHERE token = $1",
-            &[&data.token],
-        ) {
-            match data.action.as_ref() {
-                "add" => {
-                    client
-                        .execute(
-                            "INSERT INTO todos VALUES ($1, $2, $3, $4)",
-                            &[&data.username, &data.text, &false, &data.id],
-                        )
-                        .unwrap();
-                    Json(serde_json::json!({
-                        "error": false,
-                    }))
-                }
-                "remove" => {
-                    client
-                        .execute("DELETE FROM todos WHERE id = $1", &[&data.id])
-                        .unwrap();
-                    Json(serde_json::json!({
-                        "error": false,
-                    }))
-                }
-                "done" => {
-                    client
-                        .execute(
-                            "UPDATE todos SET done = $1 WHERE id = $2",
-                            &[&data.done, &data.id],
-                        )
-                        .unwrap();
-                    Json(serde_json::json!({
-                        "error": false,
-                    }))
-                }
-                _ => Json(serde_json::json!({
-                    "error": true, "error_message": "Invalid change"
-                })),
+    let token_check = check_token(&data.token);
+    if !token_check.error {
+        match data.action.as_ref() {
+            "add" => {
+                client
+                    .execute(
+                        "INSERT INTO todos VALUES ($1, $2, $3, $4)",
+                        &[
+                            &token_check.username.clone().unwrap(),
+                            &data.text,
+                            &false,
+                            &data.id,
+                        ],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                }))
             }
-        } else {
-            Json(serde_json::json!({
-                "error": true, "error_message": "Incorrect token"
-            }))
+            "remove" => {
+                client
+                    .execute(
+                        "DELETE FROM todos WHERE id = $1 AND username = $2",
+                        &[&data.id, &token_check.username.clone().unwrap()],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                }))
+            }
+            "done" => {
+                client
+                    .execute(
+                        "UPDATE todos SET done = $1 WHERE id = $2 AND username = $3",
+                        &[&data.done, &data.id, &token_check.username.clone().unwrap()],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                }))
+            }
+            _ => Json(serde_json::json!({
+                "error": true, "error_message": "Invalid change"
+            })),
         }
     } else {
         Json(serde_json::json!({
-            "error": true, "error_message": "User doesn't exist"
+            "error": true, "error_message": token_check.error_message.unwrap()
         }))
     }
 }
 #[post("/logout", format = "application/json", data = "<data>")]
 fn logout(data: Json<MeRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if let Ok(_) = client.query_one(
-        "SELECT username FROM users WHERE username = $1",
-        &[&data.username.to_string()],
-    ) {
-        if let Ok(_) = client.query_one(
-            "SELECT username FROM tokens WHERE token = $1",
-            &[&data.token],
-        ) {
-            client
-                .execute("DELETE FROM tokens WHERE token = $1", &[&data.token])
-                .unwrap();
-            Json(serde_json::json!({
-                "error": false
-            }))
-        } else {
-            Json(serde_json::json!({
-                "error": true, "error_message": "Incorrect token"
-            }))
-        }
+    let token_check = check_token(&data.token);
+    if !token_check.error {
+        client
+            .execute(
+                "DELETE FROM tokens WHERE token = $1 AND username = $2",
+                &[&data.token, &token_check.username.unwrap()],
+            )
+            .unwrap();
+        Json(serde_json::json!({
+            "error": false
+        }))
     } else {
         Json(serde_json::json!({
-            "error": true, "error_message": "User doesn't exist"
+            "error": true, "error_message": token_check.error_message.unwrap()
         }))
     }
 }
@@ -283,57 +309,45 @@ fn logout(data: Json<MeRequest>) -> Json<serde_json::Value> {
 fn change_password(data: Json<ResetRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
     let argonconfig: argon2::Config = Config::default();
-    match client.query_one(
-        "SELECT username FROM users WHERE username = $1",
-        &[&data.username.to_string()],
-    ) {
-        Ok(_) => {
-            if let Ok(_) = client.query_one(
-                "SELECT username FROM tokens WHERE token = $1",
-                &[&data.token],
-            ) {
-                let token = Uuid::new_v4().to_string();
-                client
-                    .execute(
-                        "UPDATE users SET hashword = $2 WHERE username = $1",
-                        &[
-                            &data.username.to_string(),
-                            &argon2::hash_encoded(
-                                data.password.as_bytes(),
-                                "SALTINES".as_bytes(),
-                                &argonconfig,
-                            )
-                            .unwrap(),
-                        ],
+    let token_check = check_token(&data.token);
+    if !token_check.error {
+        let token = Uuid::new_v4().to_string();
+        client
+            .execute(
+                "UPDATE users SET hashword = $2 WHERE username = $1",
+                &[
+                    &token_check.username.clone().unwrap(),
+                    &argon2::hash_encoded(
+                        data.password.as_bytes(),
+                        "SALTINES".as_bytes(),
+                        &argonconfig,
                     )
-                    .unwrap();
-                client
-                    .execute(
-                        "DELETE FROM tokens WHERE username = $1",
-                        &[&data.username.to_string()],
-                    )
-                    .unwrap();
-                client
-                    .execute(
-                        "INSERT INTO tokens VALUES ($1, $2);",
-                        &[&data.username.to_string(), &token],
-                    )
-                    .unwrap();
-                Json(serde_json::json!({
-                    "error": false,
-                    "response": {
-                        "token": token
-                    }
-                }))
-            } else {
-                Json(serde_json::json!({
-                    "error": true, "error_message": "Invalid token"
-                }))
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        client
+            .execute(
+                "DELETE FROM tokens WHERE username = $1",
+                &[&token_check.username.clone().unwrap()],
+            )
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO tokens VALUES ($1, $2);",
+                &[&token_check.username.clone().unwrap(), &token],
+            )
+            .unwrap();
+        Json(serde_json::json!({
+            "error": false,
+            "response": {
+                "token": token
             }
-        }
-        Err(_) => Json(serde_json::json!({
+        }))
+    } else {
+        Json(serde_json::json!({
             "error": true, "error_message": "User doesn't exist"
-        })),
+        }))
     }
 }
 #[post("/signup", format = "application/json", data = "<data>")]

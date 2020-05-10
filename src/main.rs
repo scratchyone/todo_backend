@@ -40,11 +40,19 @@ fn check_token(token: &str) -> TokenInfo {
         .send();
     match res {
         Ok(res) => match res.json::<TokenResponse>() {
-            Ok(res) => TokenInfo {
-                token: token.to_owned(),
-                username: res.username,
-                error: false,
-                error_message: None,
+            Ok(res) => match res.error {
+                false => TokenInfo {
+                    token: token.to_owned(),
+                    username: res.username,
+                    error: false,
+                    error_message: None,
+                },
+                true => TokenInfo {
+                    token: token.to_owned(),
+                    username: None,
+                    error: true,
+                    error_message: Some("Invalid token".to_owned()),
+                },
             },
             Err(_) => TokenInfo {
                 token: token.to_owned(),

@@ -112,6 +112,7 @@ struct User {
 struct Todo {
     text: String,
     done: bool,
+    bold: bool,
     id: String,
     num: i32,
 }
@@ -173,6 +174,7 @@ fn me(data: Json<MeRequest>) -> Json<serde_json::Value> {
             .map(|n| Todo {
                 text: n.get("todo"),
                 done: n.get("done"),
+                bold: n.get("bold"),
                 id: n.get("id"),
                 num: n.get("num"),
             })
@@ -248,12 +250,13 @@ fn update(data: Json<UpdateRequest>) -> Json<serde_json::Value> {
             "add" => {
                 client
                     .execute(
-                        "INSERT INTO todos VALUES ($1, $2, $3, $4)",
+                        "INSERT INTO todos VALUES ($1, $2, $3, $4, DEFAULT, $5)",
                         &[
                             &token_check.username.clone().unwrap(),
                             &data.text,
                             &false,
                             &data.id,
+                            &false
                         ],
                     )
                     .unwrap();
@@ -276,6 +279,17 @@ fn update(data: Json<UpdateRequest>) -> Json<serde_json::Value> {
                 client
                     .execute(
                         "UPDATE todos SET done = $1 WHERE id = $2 AND username = $3",
+                        &[&data.done, &data.id, &token_check.username.clone().unwrap()],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                }))
+            }
+            "bold" => {
+                client
+                    .execute(
+                        "UPDATE todos SET bold = $1 WHERE id = $2 AND username = $3",
                         &[&data.done, &data.id, &token_check.username.clone().unwrap()],
                     )
                     .unwrap();
@@ -442,7 +456,8 @@ CREATE TABLE IF NOT EXISTS todos (
     todo text,
     done boolean,
     id text,
-    num serial
+    num serial,
+    bold boolean
 )",
         )
         .unwrap();

@@ -11,4 +11,5 @@ RUN cargo build --release
 
 RUN rm -rf src
 COPY ./ .
+RUN cargo build --release
 CMD cargo run --release

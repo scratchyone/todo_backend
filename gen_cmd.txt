@@ -1,0 +1,1 @@
+python run_language_modeling.py --output_dir=output --model_type=gpt2 --model_name_or_path=gpt2-medium --do_train --train_data_file="trumptweet.txt"

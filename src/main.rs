@@ -3,8 +3,11 @@
 extern crate rocket;
 use argon2::{self, Config};
 use postgres::{Client, NoTls};
+use redis;
+use redis::Commands;
 use reqwest;
 use rocket::http::Method;
+use rocket_client_addr::ClientRealAddr;
 use rocket_contrib::json::Json;
 use rocket_cors;
 use rocket_cors::{AllowedHeaders, AllowedOrigins, Cors, CorsOptions};
@@ -84,7 +87,6 @@ struct LoginRequest {
 #[derive(Serialize, Deserialize)]
 struct MeRequest {
     token: String,
-    username: String,
 }
 #[derive(Serialize, Deserialize)]
 struct EmailRequest {
@@ -126,36 +128,64 @@ struct Database {
 fn index() -> &'static str {
     "online"
 }
+
+fn rate_limit_check(ip: String, preface: &str, num: i32, seconds: i32) -> bool {
+    println!("{}", ip);
+    let client = redis::Client::open("redis://redis/").unwrap();
+    let mut con = client.get_connection().unwrap();
+    let con = &mut con;
+    let limited: Option<i32> = con.get(&format!("{}_{}", preface, ip)).unwrap();
+    let mut cont = true;
+    if let Some(lim_num) = limited {
+        if lim_num > num {
+            cont = false;
+        }
+    } else {
+        con.set::<String, i32, ()>(format!("{}_{}", preface, ip), 0)
+            .unwrap();
+        con.expire::<String, i32>(format!("{}_{}", preface, ip), seconds as usize)
+            .unwrap();
+    }
+    con.incr::<String, i32, ()>(format!("{}_{}", preface, ip), 1)
+        .unwrap();
+    cont
+}
 #[post("/login", format = "application/json", data = "<data>")]
-fn login(data: Json<LoginRequest>) -> Json<serde_json::Value> {
+fn login(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if let Ok(user) = client.query_one(
-        "SELECT * FROM users WHERE username = $1",
-        &[&data.username.to_string()],
-    ) {
-        let hashword: String = user.get("hashword");
-        if argon2::verify_encoded(&hashword, &data.password.as_bytes()).unwrap() {
-            let token = Uuid::new_v4().to_string();
-            client
-                .execute(
-                    "INSERT INTO tokens VALUES ($1, $2);",
-                    &[&data.username.to_string(), &token],
-                )
-                .unwrap();
-            Json(serde_json::json!({
-                "error": false,
-                "response": {
-            "token": token
-                }
-            }))
+    if rate_limit_check(client_addr.get_ipv4_string().unwrap(), "login_rate", 6, 60) {
+        if let Ok(user) = client.query_one(
+            "SELECT * FROM users WHERE username = $1",
+            &[&data.username.to_string()],
+        ) {
+            let hashword: String = user.get("hashword");
+            if argon2::verify_encoded(&hashword, &data.password.as_bytes()).unwrap() {
+                let token = Uuid::new_v4().to_string();
+                client
+                    .execute(
+                        "INSERT INTO tokens VALUES ($1, $2);",
+                        &[&data.username.to_string(), &token],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                    "response": {
+                "token": token
+                    }
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "error": true, "error_message": "Incorrect username/password"
+                }))
+            }
         } else {
             Json(serde_json::json!({
-                "error": true, "error_message": "Incorrect username/password"
+                "error": true, "error_message": "User doesn't exist"
             }))
         }
     } else {
         Json(serde_json::json!({
-            "error": true, "error_message": "User doesn't exist"
+            "error": true, "error_message": "Rate limit reached"
         }))
     }
 }
@@ -167,7 +197,7 @@ fn me(data: Json<MeRequest>) -> Json<serde_json::Value> {
         let todos: Vec<Todo> = client
             .query(
                 "SELECT * FROM todos WHERE username = $1 ORDER BY num",
-                &[&token_check.username.unwrap()],
+                &[&token_check.username.clone().unwrap()],
             )
             .unwrap()
             .iter()
@@ -182,7 +212,7 @@ fn me(data: Json<MeRequest>) -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "error": false,
             "response": {
-                "user": {"username": data.username, "todos": todos},
+                "user": {"username": &token_check.username.unwrap(), "todos": todos},
             }
         }))
     } else {
@@ -256,7 +286,7 @@ fn update(data: Json<UpdateRequest>) -> Json<serde_json::Value> {
                             &data.text,
                             &false,
                             &data.id,
-                            &false
+                            &false,
                         ],
                     )
                     .unwrap();
@@ -373,45 +403,51 @@ fn change_password(data: Json<ResetRequest>) -> Json<serde_json::Value> {
     }
 }
 #[post("/signup", format = "application/json", data = "<data>")]
-fn signup(data: Json<LoginRequest>) -> Json<serde_json::Value> {
+fn signup(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    let argonconfig: argon2::Config = Config::default();
-    match client.query_one(
-        "SELECT username FROM users WHERE username = $1",
-        &[&data.username.to_string()],
-    ) {
-        Err(_) => {
-            let token = Uuid::new_v4().to_string();
-            client
-                .execute(
-                    "INSERT INTO users VALUES ($1, $2);",
-                    &[
-                        &data.username.to_string(),
-                        &argon2::hash_encoded(
-                            data.password.as_bytes(),
-                            "SALTINES".as_bytes(),
-                            &argonconfig,
-                        )
-                        .unwrap(),
-                    ],
-                )
-                .unwrap();
-            client
-                .execute(
-                    "INSERT INTO tokens VALUES ($1, $2);",
-                    &[&data.username.to_string(), &token],
-                )
-                .unwrap();
-            Json(serde_json::json!({
-                "error": false,
-                "response": {
-                    "token": token
-                }
-            }))
+    if rate_limit_check(client_addr.get_ipv4_string().unwrap(), "signup_rate", 6, 60) {
+        let argonconfig: argon2::Config = Config::default();
+        match client.query_one(
+            "SELECT username FROM users WHERE username = $1",
+            &[&data.username.to_string()],
+        ) {
+            Err(_) => {
+                let token = Uuid::new_v4().to_string();
+                client
+                    .execute(
+                        "INSERT INTO users VALUES ($1, $2);",
+                        &[
+                            &data.username.to_string(),
+                            &argon2::hash_encoded(
+                                data.password.as_bytes(),
+                                "SALTINES".as_bytes(),
+                                &argonconfig,
+                            )
+                            .unwrap(),
+                        ],
+                    )
+                    .unwrap();
+                client
+                    .execute(
+                        "INSERT INTO tokens VALUES ($1, $2);",
+                        &[&data.username.to_string(), &token],
+                    )
+                    .unwrap();
+                Json(serde_json::json!({
+                    "error": false,
+                    "response": {
+                        "token": token
+                    }
+                }))
+            }
+            Ok(_) => Json(serde_json::json!({
+                "error": true, "error_message": "User already exists"
+            })),
         }
-        Ok(_) => Json(serde_json::json!({
-            "error": true, "error_message": "User already exists"
-        })),
+    } else {
+        Json(serde_json::json!({
+            "error": true, "error_message": "Rate limit reached"
+        }))
     }
 }
 fn make_cors() -> Cors {

@@ -153,7 +153,12 @@ fn rate_limit_check(ip: String, preface: &str, num: i32, seconds: i32) -> bool {
 #[post("/login", format = "application/json", data = "<data>")]
 fn login(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if rate_limit_check(client_addr.get_ipv4_string().unwrap(), "login_rate", 6, 60) {
+    let mut ip = client_addr.get_ipv4_string();
+    if ip == None {
+        ip = client_addr.get_ipv6_string();
+    }
+    ip=ip.unwrap();
+    if rate_limit_check(ip, "login_rate", 6, 60) {
         if let Ok(user) = client.query_one(
             "SELECT * FROM users WHERE username = $1",
             &[&data.username.to_string()],
@@ -405,7 +410,12 @@ fn change_password(data: Json<ResetRequest>) -> Json<serde_json::Value> {
 #[post("/signup", format = "application/json", data = "<data>")]
 fn signup(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if rate_limit_check(client_addr.get_ipv4_string().unwrap(), "signup_rate", 6, 60) {
+    let mut ip = client_addr.get_ipv4_string();
+    if ip == None {
+        ip = client_addr.get_ipv6_string();
+    }
+    ip=ip.unwrap();
+    if rate_limit_check(ip, "signup_rate", 6, 60) {
         let argonconfig: argon2::Config = Config::default();
         match client.query_one(
             "SELECT username FROM users WHERE username = $1",

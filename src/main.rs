@@ -3,9 +3,6 @@
 extern crate rocket;
 use argon2::{self, Config};
 use postgres::{Client, NoTls};
-use redis;
-use redis::Commands;
-use reqwest;
 use rocket::http::Method;
 use rocket_client_addr::ClientRealAddr;
 use rocket_contrib::json::Json;
@@ -35,41 +32,30 @@ struct TokenResponse {
     username: Option<String>,
 }
 fn check_token(token: &str) -> TokenInfo {
-    let client = reqwest::blocking::Client::new();
-    let res = client
-        .post("http://auth/check_token")
-        .body(serde_json::to_string(&serde_json::json!({ "token": token.clone() })).unwrap())
-        .header("content-type", "application/json")
-        .send();
-    match res {
-        Ok(res) => match res.json::<TokenResponse>() {
-            Ok(res) => match res.error {
-                false => TokenInfo {
-                    token: token.to_owned(),
-                    username: res.username,
-                    error: false,
-                    error_message: None,
-                },
-                true => TokenInfo {
-                    token: token.to_owned(),
-                    username: None,
-                    error: true,
-                    error_message: Some("Invalid token".to_owned()),
-                },
-            },
-            Err(_) => TokenInfo {
+    let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
+    if let Ok(user) = client.query_one("SELECT username FROM tokens WHERE token = $1", &[&token]) {
+        if token != "" {
+            TokenInfo {
+                token: token.to_owned(),
+                username: Some(user.get::<&str, String>("username")),
+                error: false,
+                error_message: None,
+            }
+        } else {
+            TokenInfo {
                 token: token.to_owned(),
                 username: None,
                 error: true,
-                error_message: Some("Error parsing JSON".to_owned()),
-            },
-        },
-        Err(_) => TokenInfo {
+                error_message: Some("Invalid token".to_owned()),
+            }
+        }
+    } else {
+        TokenInfo {
             token: token.to_owned(),
             username: None,
             error: true,
-            error_message: Some("Error sending request".to_owned()),
-        },
+            error_message: Some("Invalid token".to_owned()),
+        }
     }
 }
 
@@ -129,31 +115,14 @@ fn index() -> &'static str {
     "online"
 }
 
-fn rate_limit_check(ip: String, preface: &str, num: i32, seconds: i32) -> bool {
-    println!("{}", ip);
-    let client = redis::Client::open("redis://redis/").unwrap();
-    let mut con = client.get_connection().unwrap();
-    let con = &mut con;
-    let limited: Option<i32> = con.get(&format!("{}_{}", preface, ip)).unwrap();
-    let mut cont = true;
-    if let Some(lim_num) = limited {
-        if lim_num > num {
-            cont = false;
-        }
-    } else {
-        con.set::<String, i32, ()>(format!("{}_{}", preface, ip), 0)
-            .unwrap();
-        con.expire::<String, i32>(format!("{}_{}", preface, ip), seconds as usize)
-            .unwrap();
-    }
-    con.incr::<String, i32, ()>(format!("{}_{}", preface, ip), 1)
-        .unwrap();
-    cont
+fn rate_limit_check(_ip: String, _preface: &str, _num: i32, _seconds: i32) -> bool {
+    // TODO: Re-add rate limit without needing redis
+    true
 }
 #[post("/login", format = "application/json", data = "<data>")]
 fn login(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if rate_limit_check(client_addr.get_ipv6_string().unwrap(), "login_rate", 6, 60) {
+    if rate_limit_check(client_addr.get_ipv6_string(), "login_rate", 6, 60) {
         if let Ok(user) = client.query_one(
             "SELECT * FROM users WHERE username = $1",
             &[&data.username.to_string()],
@@ -221,6 +190,7 @@ fn me(data: Json<MeRequest>) -> Json<serde_json::Value> {
         }))
     }
 }
+/*
 #[post("/email", format = "application/json", data = "<data>")]
 fn email(data: Json<EmailRequest>) -> Json<serde_json::Value> {
     //let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
@@ -271,6 +241,7 @@ fn email(data: Json<EmailRequest>) -> Json<serde_json::Value> {
         "error": true, "error_message": "User doesn't exist"
     }))
 }
+*/
 #[post("/update", format = "application/json", data = "<data>")]
 fn update(data: Json<UpdateRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
@@ -405,7 +376,7 @@ fn change_password(data: Json<ResetRequest>) -> Json<serde_json::Value> {
 #[post("/signup", format = "application/json", data = "<data>")]
 fn signup(client_addr: &ClientRealAddr, data: Json<LoginRequest>) -> Json<serde_json::Value> {
     let mut client = Client::connect("host=db user=postgres password=example", NoTls).unwrap();
-    if rate_limit_check(client_addr.get_ipv6_string().unwrap(), "signup_rate", 6, 60) {
+    if rate_limit_check(client_addr.get_ipv6_string(), "signup_rate", 6, 60) {
         let argonconfig: argon2::Config = Config::default();
         match client.query_one(
             "SELECT username FROM users WHERE username = $1",
@@ -512,7 +483,7 @@ CREATE TABLE IF NOT EXISTS todos (
                 me,
                 logout,
                 update,
-                email,
+                // email,
                 change_password
             ],
         )
